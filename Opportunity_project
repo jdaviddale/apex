@@ -1,0 +1,204 @@
+/**
+ * A Queueable class that:
+ * 1) Duplicates an Asana "project template" (custom template) for each unique Opportunity,
+ * 2) Names the new project "<opportunityName>"
+ * 3) Creates tasks for each OpportunityLineItem in the list:
+ *    - Task name = "<ProductName>"
+ *    - Notes contain Opp ID, OLI ID, product code, etc.
+ *    - Custom fields:
+ *         * '1209144419346124' => Opportunity ID
+ *         * '1209460523662944' => OLI ID
+ *
+ * Implements Database.AllowsCallouts to make external HTTP requests.
+ */
+public without sharing class AsanaTaskQueueable implements Queueable, Database.AllowsCallouts {
+    
+    // Template project GID to duplicate
+    private static final String TEMPLATE_PROJECT_GID = '1209460391284462';
+    
+    // For simplicity, we store the bearer token here; ideally use a Named Credential
+    private static final String ASANA_BEARER_TOKEN = 'Bearer 2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8';
+    
+    private List<OpportunityLineItem> oppLineItems;
+
+    public AsanaTaskQueueable(List<OpportunityLineItem> oppLineItems) {
+        this.oppLineItems = oppLineItems;
+    }
+    
+    public void execute(QueueableContext context) {
+        // 1) Identify unique Opp IDs
+        Set<Id> oppIds = new Set<Id>();
+        for (OpportunityLineItem oli : oppLineItems) {
+            if (oli.OpportunityId != null) {
+                oppIds.add(oli.OpportunityId);
+            }
+        }
+        
+        // 2) Build map: OppId -> OppName
+        Map<Id, String> oppNameById = new Map<Id, String>();
+        for (OpportunityLineItem oli : oppLineItems) {
+            if (oli.OpportunityId != null && oli.Opportunity != null) {
+                oppNameById.put(oli.OpportunityId, oli.Opportunity.Name);
+            }
+        }
+        
+        // 3) Duplicate the template, store new project GIDs
+        Map<Id, String> asanaProjectByOppId = new Map<Id, String>();
+        for (Id oppId : oppIds) {
+            String oppName = oppNameById.get(oppId);
+            String newProjectGid = duplicateAsanaTemplateProject(oppId, oppName);
+            if (newProjectGid != null) {
+                asanaProjectByOppId.put(oppId, newProjectGid);
+            }
+        }
+        
+        // 4) For each OLI, create tasks in the new project
+        for (OpportunityLineItem oli : oppLineItems) {
+            if (!asanaProjectByOppId.containsKey(oli.OpportunityId)) {
+                System.debug('No Asana project for OLI with Opp: ' + oli.OpportunityId);
+                continue;
+            }
+            String projectId = asanaProjectByOppId.get(oli.OpportunityId);
+            
+            Integer qty = (oli.Quantity == null) ? 1 : Integer.valueOf(oli.Quantity);
+            for (Integer i = 0; i < qty; i++) {
+                createAsanaTask(oli, projectId);
+            }
+        }
+    }
+    
+    /**
+     * Duplicates the custom template project for a given Opportunity
+     * and returns the newly created project's GID or null on error.
+     */
+    private String duplicateAsanaTemplateProject(Id opportunityId, String opportunityName) {
+        HttpRequest req = new HttpRequest();
+        req.setMethod('POST');
+        
+        // /projects/{template_gid}/duplicate
+        req.setEndpoint('https://app.asana.com/api/1.0/projects/' 
+                        + TEMPLATE_PROJECT_GID + '/duplicate');
+        
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', ASANA_BEARER_TOKEN);
+        
+        String finalOppName = (opportunityName == null) ? '' : opportunityName;
+        
+        // We'll name the new project after the Opp
+        Map<String, Object> dataBody = new Map<String, Object>{
+            'name' => finalOppName,
+            'team' => '1208917370288988',    // Adjust as needed
+            'workspace' => '20443498503348', // Adjust as needed
+            'include' => new List<String>{
+                'notes',
+                'members',
+                'task_notes',
+                'task_assignee',
+                'task_subtasks',
+                'task_attachments',
+                'task_dates',
+                'task_dependencies'
+            }
+        };
+        
+        // Wrap in {"data": {...}}
+        Map<String, Object> parentBody = new Map<String, Object>{ 
+            'data' => dataBody 
+        };
+        req.setBody(JSON.serialize(parentBody));
+        
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+        
+        System.debug('duplicateAsanaTemplateProject() OppId=' + opportunityId 
+                     + ', code=' + res.getStatusCode());
+        System.debug('duplicateAsanaTemplateProject() body: ' + res.getBody());
+        
+        if (res.getStatusCode() >= 200 && res.getStatusCode() < 300) {
+            // Expecting data.new_project.gid
+            Map<String, Object> topLevel = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+            if (topLevel.containsKey('data')) {
+                Map<String, Object> data = (Map<String, Object>) topLevel.get('data');
+                if (data.containsKey('new_project')) {
+                    Map<String, Object> newProj = (Map<String, Object>) data.get('new_project');
+                    if (newProj.containsKey('gid')) {
+                        String newProjectGid = (String) newProj.get('gid');
+                        System.debug('Successfully duplicated template. New project GID: ' + newProjectGid);
+                        return newProjectGid;
+                    }
+                }
+            }
+        } else {
+            System.debug('Duplicating template failed for Opp ' + opportunityId 
+                         + ': ' + res.getBody());
+        }
+        return null;
+    }
+
+    /**
+     * Creates a single task in the newly duplicated project, 
+     * sets two custom fields:
+     * - '1209144419346124' => Opportunity ID
+     * - '1209460523662944' => OLI ID
+     */
+    private void createAsanaTask(OpportunityLineItem oli, String asanaProjectId) {
+        
+        HttpRequest req = new HttpRequest();
+        req.setMethod('POST');
+        req.setEndpoint('https://app.asana.com/api/1.0/tasks');
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', ASANA_BEARER_TOKEN);
+        
+        String oppId        = (oli.OpportunityId == null) ? '' : String.valueOf(oli.OpportunityId);
+        String productName  = (oli.Product2 != null && oli.Product2.Name != null) 
+                              ? oli.Product2.Name 
+                              : '';
+        String productCode  = (oli.Product2 != null && oli.Product2.ProductCode != null) 
+                              ? oli.Product2.ProductCode 
+                              : '';
+        String oppProductId = (oli.Id != null) ? String.valueOf(oli.Id) : '';
+        
+        // Task name
+        String taskName = productName;
+        
+        // Notes
+        String notesStr = 'Opportunity ID: ' + oppId +
+                          '\nOpportunity Product ID: ' + oppProductId +
+                          '\nProduct Code: ' + productCode +
+                          '\nProduct Name: ' + productName;
+        
+        // Map custom fields
+        Map<String, Object> customFieldsMap = new Map<String, Object>{
+            '1209144419346124' => oppId,        // Opp ID
+            '1209460523662944' => oppProductId  // OLI ID
+        };
+        
+        Map<String, Object> dataBody = new Map<String, Object>{
+            'name'          => taskName,
+            'notes'         => notesStr,
+            'projects'      => new List<String>{ asanaProjectId },
+            'custom_fields' => customFieldsMap
+        };
+        
+        Map<String, Object> parentBody = new Map<String, Object>{ 
+            'data' => dataBody 
+        };
+        
+        req.setBody(JSON.serialize(parentBody));
+        
+        Http http = new Http();
+        HttpResponse res = http.send(req);
+        
+        System.debug('createAsanaTask() code: ' + res.getStatusCode());
+        System.debug('createAsanaTask() body: ' + res.getBody());
+        
+        if (res.getStatusCode() >= 200 && res.getStatusCode() < 300) {
+            System.debug('Asana task created successfully for OLI ' 
+                         + oli.Id + ' in project ' + asanaProjectId);
+        } else {
+            System.debug('Asana Task creation failed for OLI ' 
+                         + oli.Id + ' -- Status: ' + res.getStatusCode() 
+                         + ' -- Body: ' + res.getBody());
+        }
+    }
+}
