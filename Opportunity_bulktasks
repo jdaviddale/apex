@@ -1,0 +1,49 @@
+/**
+ * This class is called from Flow (via @InvocableMethod).
+ * The Flow passes a collection of OpportunityLineItems (likely with minimal fields).
+ * We then re-query the OpportunityLineItems to retrieve Product2 fields 
+ * before enqueuing the queueable job.
+ */
+public with sharing class BulkTaskCreator {
+    
+    @InvocableMethod(
+        label='Create Asana Tasks' 
+        description='Re-queries OLIs to get Product2 fields, then enqueues AsanaTaskQueueable.'
+    )
+    public static void createTasks(List<List<OpportunityLineItem>> allProductsCollection) {
+        
+        // 1. Flatten the list-of-lists from Flow
+        List<Id> oliIds = new List<Id>();
+        for (List<OpportunityLineItem> oliSublist : allProductsCollection) {
+            for (OpportunityLineItem oli : oliSublist) {
+                if (oli.Id != null) {
+                    oliIds.add(oli.Id);
+                }
+            }
+        }
+        
+        // 2. Re-query to ensure we have the fields needed for AsanaTaskQueueable
+        //    - Include Product2.ProductCode, Product2.Name, or any other fields you need
+        //    - Note: Adjust these fields as needed for your scenario
+        List<OpportunityLineItem> oliRecords = new List<OpportunityLineItem>();
+        if (!oliIds.isEmpty()) {
+            oliRecords = [
+                SELECT Id,
+                       Opportunity.Name,
+                       OpportunityId,
+                       Quantity,
+                       Product2Id,
+                       Product2.ProductCode,
+                       Product2.Name
+                FROM OpportunityLineItem
+                WHERE Id IN :oliIds
+            ];
+        }
+        
+        // 3. Enqueue a single async job to handle creation of Asana tasks 
+        //    with all the required OLI + Product2 data
+        if (!oliRecords.isEmpty()) {
+            System.enqueueJob(new AsanaTaskQueueable(oliRecords));
+        }
+    }
+}
