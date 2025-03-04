@@ -1,0 +1,132 @@
+public with sharing class AsanaProjectQueueable implements Queueable, Database.AllowsCallouts {
+
+    private Id rfpId;
+
+    // ✅ Asana API Credentials & Required Parameters
+    private static final String ASANA_API_BASE_URL = 'https://app.asana.com/api/1.0/';
+    private static final String ASANA_ACCESS_TOKEN = 'Bearer 2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8'; // Use Named Credentials in Production
+    private static final String WORKSPACE_GID = '20443498503348'; // ✅ Required Asana Workspace GID
+    private static final String TEMPLATE_PROJECT_GID = '1208926384623108'; // ✅ Asana Template Project GID
+    private static final String TEAM_GID = '1208306980181975'; // ✅ Asana Team GID
+
+    // Constructor to pass record ID
+    public AsanaProjectQueueable(Id rfpId) {
+        this.rfpId = rfpId;
+    }
+
+    // ✅ Invocable Method for Flow
+    @InvocableMethod(label='Create Asana Project' description='Creates an Asana project from an RFP record using a template')
+    public static void enqueueAsanaProject(List<Id> rfpIds) {
+        if (rfpIds == null || rfpIds.isEmpty()) {
+            return;
+        }
+
+        for (Id rfpId : rfpIds) {
+            System.enqueueJob(new AsanaProjectQueueable(rfpId));
+        }
+    }
+
+    public void execute(QueueableContext context) {
+        try {
+            // ✅ Query RFP details
+            RFP__c rfp = [SELECT Name, Account__c, Account__r.Name, Contact__c, Contact__r.Name,
+                           RFP_Number__c, Due_Date__c, Electronic_Submission__c, Hardcopy_Submission__c, 
+                           Solution_Type__c, OwnerId, Owner.Name
+                           FROM RFP__c 
+                           WHERE Id = :rfpId LIMIT 1];
+
+            // ✅ Generate project name
+            String projectName = rfp.Name + ' - ' + (rfp.Account__r != null ? rfp.Account__r.Name : 'No Account');
+            String description = formatDescription(rfp);
+
+            // ✅ Prepare API request body for duplicating the template project
+            Map<String, Object> requestBody = new Map<String, Object>{
+                'data' => new Map<String, Object>{
+                    'name' => projectName,
+                    'workspace' => WORKSPACE_GID,  // ✅ Required Asana Workspace GID
+                    'include' => new List<String>{'members', 'task_notes', 'task_assignee', 'task_subtasks', 'task_templates'},  // ✅ Ensure tasks & sections are copied
+                    'team' => TEAM_GID
+                }
+            };
+
+            String jsonRequest = JSON.serialize(requestBody);
+
+            // ✅ Correct API endpoint for duplicating the template project
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(ASANA_API_BASE_URL + 'projects/' + TEMPLATE_PROJECT_GID + '/duplicate'); // ✅ Using template GID
+            req.setMethod('POST');
+            req.setHeader('Authorization', ASANA_ACCESS_TOKEN);
+            req.setHeader('Content-Type', 'application/json');
+            req.setBody(jsonRequest);
+
+            // Execute the callout
+            Http http = new Http();
+            HttpResponse res = http.send(req);
+
+            if (res.getStatusCode() == 201) {
+                // ✅ Extract the new Project GID from the response
+                Map<String, Object> responseMap = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+                if (responseMap.containsKey('data')) {
+                    Map<String, Object> dataMap = (Map<String, Object>) responseMap.get('data');
+                    String newProjectGid = (String) dataMap.get('gid');
+
+                    System.debug('✅ Asana Project Created Successfully with GID: ' + newProjectGid);
+
+                    // ✅ Call the method to update the project description
+                    updateProjectDescription(newProjectGid, description);
+                }
+            } else {
+                System.debug('❌ Failed to create Asana Project: ' + res.getBody());
+            }
+
+        } catch (Exception e) {
+            System.debug('🚨 Error Creating Asana Project: ' + e.getMessage());
+        }
+    }
+
+    // ✅ Helper method to update the project description
+private static void updateProjectDescription(String projectGid, String description) {
+    try {
+        // ✅ Correct API request format
+        Map<String, Object> updateBody = new Map<String, Object>{
+            'data' => new Map<String, Object>{
+                'notes' => description // ✅ Wrap "notes" inside "data"
+            }
+        };
+
+        String jsonUpdateRequest = JSON.serialize(updateBody);
+
+        HttpRequest updateReq = new HttpRequest();
+        updateReq.setEndpoint(ASANA_API_BASE_URL + 'projects/' + projectGid);
+        updateReq.setMethod('PUT'); // ✅ Using PUT to update project details
+        updateReq.setHeader('Authorization', ASANA_ACCESS_TOKEN);
+        updateReq.setHeader('Content-Type', 'application/json');
+        updateReq.setBody(jsonUpdateRequest);
+
+        Http http = new Http();
+        HttpResponse updateRes = http.send(updateReq);
+
+        if (updateRes.getStatusCode() == 200) {
+            System.debug('✅ Project Description Updated Successfully: ' + updateRes.getBody());
+        } else {
+            System.debug('❌ Failed to update project description: ' + updateRes.getBody());
+        }
+    } catch (Exception e) {
+        System.debug('🚨 Error Updating Asana Project Description: ' + e.getMessage());
+    }
+}
+
+    // ✅ Helper method for formatting the project description
+    private static String formatDescription(RFP__c rfp) {
+        String submissionType = (rfp.Electronic_Submission__c) ? 'Electronic' : (rfp.Hardcopy_Submission__c) ? 'Hard Copy' : 'Not specified';
+
+        return 'Salesforce Account Name: ' + (rfp.Account__r != null ? rfp.Account__r.Name : 'No Account') + '\n' +
+               'RFP Name: ' + rfp.Name + '\n' +
+               'District Contact Name: ' + (rfp.Contact__r != null ? rfp.Contact__r.Name : 'No Contact') + '\n' +
+               'RFP Number: ' + rfp.RFP_Number__c + '\n' +
+               'Due Date: ' + String.valueOf(rfp.Due_Date__c) + '\n' +
+               'Submission Type: ' + submissionType + '\n' +
+               'Solution Type: ' + rfp.Solution_Type__c + '\n' +
+               'Owner: ' + (rfp.Owner != null ? rfp.Owner.Name : 'No Owner');
+    }
+}
