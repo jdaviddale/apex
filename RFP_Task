@@ -1,0 +1,148 @@
+public with sharing class AsanaTaskCreatorQueueable implements Queueable, Database.AllowsCallouts {
+
+    private Id rfpId;
+
+    // ✅ Asana API Credentials & Required Parameters
+    private static final String ASANA_API_BASE_URL = 'https://app.asana.com/api/1.0/';
+    private static final String ASANA_ACCESS_TOKEN = 'Bearer 2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8'; // Use Named Credentials in Production
+    private static final String WORKSPACE_GID = '20443498503348'; // ✅ Required Asana Workspace GID
+    private static final String TEAM_GID = '1208306980181975'; // ✅ Asana Team GID
+    private static final String PROJECT_GID = '1208687112584130'; // ✅ Existing Asana Project GID
+    private static final String PROJECT_SECTION_GID = '1208699692379470'; // ✅ Replace with actual Section GID
+
+    // Constructor to pass record ID
+    public AsanaTaskCreatorQueueable(Id rfpId) {
+        this.rfpId = rfpId;
+    }
+
+    // ✅ Invocable Method for Flow
+    @InvocableMethod(label='Create Asana Task' description='Creates an Asana task within an existing project when RFP Stage changes')
+    public static void enqueueAsanaTask(List<Id> rfpIds) {
+        if (rfpIds == null || rfpIds.isEmpty()) {
+            return;
+        }
+
+        for (Id rfpId : rfpIds) {
+            System.enqueueJob(new AsanaTaskCreatorQueueable(rfpId));
+        }
+    }
+
+    public void execute(QueueableContext context) {
+        try {
+            // ✅ Query RFP details
+			RFP__c rfp = [SELECT Name, Account__c, Account__r.Name, Contact__c, Contact__r.Name, Due_Date__c, 
+               			   Electronic_Submission__c, Hardcopy_Submission__c, 
+               			   Solution_Type__c
+               			   FROM RFP__c 
+              			   WHERE Id = :rfpId LIMIT 1];
+
+            // ✅ Generate task name
+            String taskName = (rfp.Account__r != null ? rfp.Account__r.Name + ' - ' : '') + rfp.Name;
+
+            // ✅ Format task description
+            String description = formatTaskDescription(rfp);
+
+            // ✅ Format Due Date to Asana's required format (yyyy-MM-dd)
+           String formattedDueDate = (rfp.Due_Date__c != null) 
+    		   ? String.valueOf(rfp.Due_Date__c.year()) + '-' + 
+      			 (rfp.Due_Date__c.month() < 10 ? '0' : '') + String.valueOf(rfp.Due_Date__c.month()) + '-' + 
+      			 (rfp.Due_Date__c.day() < 10 ? '0' : '') + String.valueOf(rfp.Due_Date__c.day()) 
+    		   : null;
+
+            // ✅ Prepare API request body for creating the task
+            Map<String, Object> requestBody = new Map<String, Object>{
+                'data' => new Map<String, Object>{
+                    'name' => taskName,
+                    'notes' => description, // ✅ Task description
+                    'projects' => new List<String>{PROJECT_GID}, // ✅ Assign task to existing project
+                    'due_on' => formattedDueDate, // ✅ Set Due Date in correct format
+                    'workspace' => WORKSPACE_GID // ✅ Required Workspace GID
+                }
+            };
+
+            String jsonRequest = JSON.serialize(requestBody);
+
+            // ✅ API endpoint to create a new task
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(ASANA_API_BASE_URL + 'tasks');
+            req.setMethod('POST');
+            req.setHeader('Authorization', ASANA_ACCESS_TOKEN);
+            req.setHeader('Content-Type', 'application/json');
+            req.setBody(jsonRequest);
+
+            // Execute the callout
+            Http http = new Http();
+            HttpResponse res = http.send(req);
+
+            if (res.getStatusCode() == 201) {
+                // ✅ Extract the new Task GID from the response
+                Map<String, Object> responseMap = (Map<String, Object>) JSON.deserializeUntyped(res.getBody());
+                if (responseMap.containsKey('data')) {
+                    Map<String, Object> dataMap = (Map<String, Object>) responseMap.get('data');
+                    String newTaskGid = (String) dataMap.get('gid');
+
+                    System.debug('✅ Asana Task Created Successfully with GID: ' + newTaskGid);
+
+                    // ✅ Move task to "Go" section
+                    moveTaskToSection(newTaskGid);
+                }
+            } else {
+                System.debug('❌ Failed to create Asana Task: ' + res.getBody());
+            }
+
+        } catch (Exception e) {
+            System.debug('🚨 Error Creating Asana Task: ' + e.getMessage());
+        }
+    }
+
+    // ✅ Helper method to move task to "Go" section
+    private static void moveTaskToSection(String taskGid) {
+        try {
+            Map<String, Object> sectionBody = new Map<String, Object>{
+                'data' => new Map<String, Object>{
+                    'task' => taskGid // ✅ Assign task to section
+                }
+            };
+
+            String jsonSectionRequest = JSON.serialize(sectionBody);
+
+            HttpRequest sectionReq = new HttpRequest();
+            sectionReq.setEndpoint(ASANA_API_BASE_URL + 'sections/' + PROJECT_SECTION_GID + '/addTask');
+            sectionReq.setMethod('POST'); // ✅ Add task to section
+            sectionReq.setHeader('Authorization', ASANA_ACCESS_TOKEN);
+            sectionReq.setHeader('Content-Type', 'application/json');
+            sectionReq.setBody(jsonSectionRequest);
+
+            Http http = new Http();
+            HttpResponse sectionRes = http.send(sectionReq);
+
+            if (sectionRes.getStatusCode() == 200) {
+                System.debug('✅ Task Moved to "Go" Section Successfully: ' + sectionRes.getBody());
+            } else {
+                System.debug('❌ Failed to move task to section: ' + sectionRes.getBody());
+            }
+        } catch (Exception e) {
+            System.debug('🚨 Error Moving Task to Section: ' + e.getMessage());
+        }
+    }
+
+    // ✅ Helper method to format task description
+    private static String formatTaskDescription(RFP__c rfp) {
+        String submissionType = 'Not specified';
+        if (rfp.Electronic_Submission__c) {
+            submissionType = 'Electronic';
+        } else if (rfp.Hardcopy_Submission__c) {
+            submissionType = 'Hard Copy';
+        }
+
+        return 'Contact: ' + (rfp.Contact__r != null ? rfp.Contact__r.Name : 'No Contact') + '\n' +
+               'Due Date: ' + (rfp.Due_Date__c != null 
+    			  ? String.valueOf(rfp.Due_Date__c.year()) + '-' + 
+      				(rfp.Due_Date__c.month() < 10 ? '0' : '') + String.valueOf(rfp.Due_Date__c.month()) + '-' + 
+     		 		(rfp.Due_Date__c.day() < 10 ? '0' : '') + String.valueOf(rfp.Due_Date__c.day()) 
+    			  : 'No Due Date') + '\n' +
+
+               'Submission Type: ' + submissionType + '\n' +
+               'Solution Type: ' + rfp.Solution_Type__c;
+    }
+}
