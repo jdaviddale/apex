@@ -1,0 +1,167 @@
+@isTest
+private class AsanaTaskCreatorQueueableTest {
+
+    // -------------------------------------------------------------------------
+    // Mock class to simulate Asana API responses (Success & Section Move)
+    // -------------------------------------------------------------------------
+    private class AsanaHttpMock implements HttpCalloutMock {
+        public HTTPResponse respond(HTTPRequest req) {
+            System.debug('HTTP Mock Called. Endpoint = ' + req.getEndpoint());
+            
+        HttpResponse res = new HttpResponse();
+        if (req.getEndpoint().contains('/tasks')) {
+            // success path (return 201)
+            res.setStatusCode(201);
+            res.setBody('{"data":{"gid":"123456789"}}');
+        } else if (req.getEndpoint().contains('/sections/')) {
+            // success for adding to a section (return 200)
+            res.setStatusCode(200);
+            res.setBody('{"data":{"success":true}}');
+        } else {
+            // fallback => returns 500 or 400, triggers “Simulated server error”
+            res.setStatusCode(500);
+            res.setBody('{"errors":[{"message":"Simulated server error"}]}');
+        }
+        return res;
+    }
+}
+    
+    // -------------------------------------------------------------------------
+    // Mock class that simulates Asana API failure (500)
+    // -------------------------------------------------------------------------
+    private class AsanaHttpMockFailure implements HttpCalloutMock {
+        public HTTPResponse respond(HTTPRequest req) {
+            HttpResponse res = new HttpResponse();
+            res.setStatusCode(500);
+            res.setStatus('500 Internal Server Error');
+            res.setBody('{"errors":[{"message":"Simulated server error"}]}');
+            return res;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // @testSetup - Create shared data
+    // -------------------------------------------------------------------------
+    @testSetup
+    static void setupTestData() {
+        // Create an Account
+        Account acc = new Account(Name='Test Account');
+        insert acc;
+
+        // Create a Contact
+        Contact con = new Contact(LastName='Test Contact', AccountId=acc.Id);
+        insert con;
+
+        // Create a minimal RFP__c (with required fields)
+        RFP__c rfp = new RFP__c(
+            Name = 'Standard RFP',
+            Account__c = acc.Id,
+            Contact__c = con.Id,
+            Due_Date__c = Date.today().addDays(7),
+            Electronic_Submission__c = true,
+            Hardcopy_Submission__c = false,
+            Solution_Type__c = 'Coaching'
+        );
+        insert rfp;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test #1: Happy path (status code == 201)
+    // -------------------------------------------------------------------------
+    @isTest static void testAsanaTaskCreationSuccess() {
+        // Retrieve existing RFP
+        RFP__c rfp = [SELECT Id FROM RFP__c LIMIT 1];
+
+        // Mock success
+        Test.setMock(HttpCalloutMock.class, new AsanaHttpMock());
+
+        Test.startTest();
+        AsanaTaskCreatorQueueable.enqueueAsanaTask(new List<Id>{ rfp.Id });
+        Test.stopTest();
+
+        // We should hit "✅ Asana Task Created Successfully" 
+        // and "✅ Task Moved to 'Go' Section Successfully" in logs
+    }
+
+    // -------------------------------------------------------------------------
+    // Test #2: Empty List
+    // -------------------------------------------------------------------------
+    @isTest static void testAsanaTaskWithEmptyList() {
+        Test.startTest();
+        AsanaTaskCreatorQueueable.enqueueAsanaTask(new List<Id>());
+        Test.stopTest();
+        // Early return => covers that branch
+    }
+
+    // -------------------------------------------------------------------------
+    // Test #3: Failure path (status code != 201)
+    // -------------------------------------------------------------------------
+    @isTest static void testAsanaTaskCreationFailure() {
+        RFP__c rfp = [SELECT Id FROM RFP__c LIMIT 1];
+
+        // Mock failure
+        Test.setMock(HttpCalloutMock.class, new AsanaHttpMockFailure());
+
+        Test.startTest();
+        AsanaTaskCreatorQueueable.enqueueAsanaTask(new List<Id>{ rfp.Id });
+        Test.stopTest();
+
+        // We should see "❌ Failed to create Asana Task: ..." in logs
+    }
+
+    // -------------------------------------------------------------------------
+    // Test #4: Additional scenario with various submission flags
+    // -------------------------------------------------------------------------
+    @isTest static void testMultipleScenarios() {
+        Account acc = [SELECT Id FROM Account LIMIT 1];
+        Contact con = [SELECT Id FROM Contact LIMIT 1];
+
+        // RFP with Hardcopy
+        RFP__c rfpHardcopy = new RFP__c(
+            Name = 'Hardcopy RFP',
+            Account__c = acc.Id,
+            Contact__c = con.Id,
+            Hardcopy_Submission__c = true,
+            Electronic_Submission__c = false,
+            Due_Date__c = Date.today().addDays(10)
+        );
+        insert rfpHardcopy;
+
+        // RFP with no submission => "Not specified", and no Due Date
+        RFP__c rfpNoSubmissionType = new RFP__c(
+            Name = 'No Submission RFP',
+            Account__c = acc.Id,
+            Contact__c = con.Id,
+            Electronic_Submission__c = false,
+            Hardcopy_Submission__c = false,
+            Due_Date__c = null
+        );
+        insert rfpNoSubmissionType;
+
+        // Use success mock again to ensure we call moveTaskToSection
+        Test.setMock(HttpCalloutMock.class, new AsanaHttpMock());
+
+        Test.startTest();
+        AsanaTaskCreatorQueueable.enqueueAsanaTask(new List<Id>{
+            rfpHardcopy.Id,
+            rfpNoSubmissionType.Id
+        });
+        Test.stopTest();
+    }
+
+    // -------------------------------------------------------------------------
+    // Test #5: Force a QueryException => triggers catch(Exception) block
+    // -------------------------------------------------------------------------
+    @isTest static void testQueryException() {
+        // Pass an Id that doesn't exist for RFP__c
+        Id fakeRfpId = '001000000000000AAA';
+
+        Test.setMock(HttpCalloutMock.class, new AsanaHttpMock());
+
+        Test.startTest();
+        AsanaTaskCreatorQueueable.enqueueAsanaTask(new List<Id>{ fakeRfpId });
+        Test.stopTest();
+
+        // This hits the catch block in execute() => "🚨 Error Creating Asana Task"
+    }
+}
