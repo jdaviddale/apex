@@ -14,7 +14,7 @@
 public without sharing class AsanaTaskQueueable implements Queueable, Database.AllowsCallouts {
     
     // Template project GID to duplicate
-    private static final String TEMPLATE_PROJECT_GID = '1209460391284462';
+    private static final String TEMPLATE_PROJECT_GID = '1209729223795600';
     
     // For simplicity, we store the bearer token here; ideally use a Named Credential
     private static final String ASANA_BEARER_TOKEN = 'Bearer 2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8';
