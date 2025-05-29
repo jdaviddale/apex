@@ -1,0 +1,118 @@
+/**
+ *  AsanaTaskSync.cls
+ *
+ *  Flow-invocable action that:
+ *    1. Creates a task in Asana.
+ *    2. Writes the new Asana gid back to the originating Salesforce Task.
+ *
+ *  SECURITY NOTE: The bearer (PAT) token is hard-coded here ONLY for quick,
+ *  sandbox-level testing.  Replace it with a Named Credential before you move
+ *  to production or commit to version control.
+ */
+public with sharing class AsanaTaskSync {
+
+    /*───────────────────────────────────────────────────────────────
+     *  Configuration constants
+     *───────────────────────────────────────────────────────────────*/
+    private static final String ASANA_PAT     = '2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8';
+    private static final String WORKSPACE_GID = '20443498503348';
+
+    /*───────────────────────────────────────────────────────────────
+     *  Helper: return ISO-8601 (yyyy-MM-dd) regardless of locale
+     *───────────────────────────────────────────────────────────────*/
+     private static String isoDate(Date d){
+    // Build a GMT DateTime from the Date, then format it in GMT
+    Datetime dt = Datetime.newInstanceGMT(d.year(), d.month(), d.day(), 0, 0, 0);
+    return dt.format('yyyy-MM-dd', 'GMT');
+    }
+    /** Returns the Name of any record given its Id (or null). */
+    private static String fetchNameById(Id recId){
+        if (recId == null) return null;
+        try{
+            String obj = recId.getSObjectType().getDescribe().getName();
+            SObject s  = Database.query(
+                'SELECT Name FROM ' + obj + ' WHERE Id = :recId LIMIT 1');
+            return (String)s.get('Name');
+        } catch (Exception e){
+            return null;        // happens only if object lacks a Name field
+        }
+    }
+    /*───────────────────────────────────────────────────────────────
+     *  DTO for Flow
+     *───────────────────────────────────────────────────────────────*/
+    public class TaskRequest {
+        @InvocableVariable(required=true) public Id     taskId;
+        @InvocableVariable(required=true) public String taskName;
+        @InvocableVariable               public Date    dueDate;
+        @InvocableVariable               public String  description;   // ← already mapped to notes
+        @InvocableVariable               public String  relatedToId;     // ❶ NEW
+        @InvocableVariable               public String  status;
+        @InvocableVariable               public String  assigneeGid;
+        @InvocableVariable               public String  projectGid;
+}
+
+    /*───────────────────────────────────────────────────────────────
+     *  Flow-invocable method
+     *───────────────────────────────────────────────────────────────*/
+    @InvocableMethod(label='Create Asana Task (Hard-coded PAT)')
+    public static void createTask(List<TaskRequest> requests) {
+
+        Http http = new Http();
+
+        for (TaskRequest req : requests) {
+
+            /* build JSON body */
+            Map<String,Object> data = new Map<String,Object>{
+                'name'      => req.taskName,
+                'workspace' => WORKSPACE_GID
+            };
+            if (req.dueDate      != null) data.put('due_on',  isoDate(req.dueDate));
+            if (req.description  != null) data.put('notes',   req.description);
+            if ('Completed'.equalsIgnoreCase(req.status)) data.put('completed', true);
+            if (String.isNotBlank(req.assigneeGid)) data.put('assignee', req.assigneeGid);
+            if (String.isNotBlank(req.projectGid))  data.put('projects', new List<String>{req.projectGid});
+            /* 2 ── build notes (DESCRIPTION + Related To)  ← ➊ PASTE THIS BLOCK */
+            String notes = '';
+            if (String.isNotBlank(req.description))
+                notes += req.description;
+        
+            // req.relatedToId is the WhatId passed in from Flow
+            String relatedName = fetchNameById(req.relatedToId);
+            if (relatedName != null)
+                notes += (notes == '' ? '' : '\n\n') + 'Related To: ' + relatedName;
+        
+            if (notes != '') data.put('notes', notes);
+            /* HTTP callout */
+            HttpRequest h = new HttpRequest();
+            h.setEndpoint('https://app.asana.com/api/1.0/tasks');
+            h.setMethod('POST');
+            h.setHeader('Content-Type',  'application/json');
+            h.setHeader('Authorization', 'Bearer ' + ASANA_PAT);
+            h.setBody(JSON.serialize(new Map<String,Object>{ 'data' => data }));
+
+            HttpResponse r = http.send(h);
+
+            /* handle success / failure */
+            if (r.getStatusCode() == 201) {
+
+                /* extract Asana gid */
+                Map<String,Object> body     = (Map<String,Object>)JSON.deserializeUntyped(r.getBody());
+                Map<String,Object> dataNode = (Map<String,Object>)body.get('data');
+                String asanaGid             = (String)dataNode.get('gid');
+
+                /* write gid back to Salesforce Task */
+                update new Task(
+                    Id                 = req.taskId,
+                    Asana_Task_ID__c   = asanaGid   // ← custom field on Activity object
+                );
+
+                // (optional) enqueue RegisterAsanaWebhook here, if using auto-registration
+                System.enqueueJob(new RegisterAsanaWebhook(asanaGid));
+
+            } else {
+                System.debug('Create-task failed: ' + r.getBody());
+                // TODO: upsert a custom log object for retries, if desired
+            }
+        }
+    }
+}
