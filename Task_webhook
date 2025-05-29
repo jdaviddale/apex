@@ -1,0 +1,65 @@
+/**
+ *  RegisterAsanaWebhook.cls
+ *
+ *  Queueable job that registers (or re‑registers) an Asana webhook for
+ *  a single task‑level resource.  Called from AsanaTaskSync once the task
+ *  is created and the gid is known.
+ *
+ *  NOTE:  If you ever move the Experience Cloud site to a new domain,
+ *  update TARGET_BASE_URL below and re‑deploy.
+ */
+public with sharing class RegisterAsanaWebhook
+        implements Queueable, Database.AllowsCallouts {
+
+    /*───────────────────────────────────────────────────────────────
+     *  Configuration
+     *───────────────────────────────────────────────────────────────*/
+    // 1) Your Experience‑Cloud site’s public base URL (no trailing slash)
+    private static final String TARGET_BASE_URL =
+        'https://engage2learn--auxpartial.sandbox.my.site.com/asanatasksync';
+
+    // 2) Personal‑access token (PAT) or replace with callout:NamedCredential
+    private static final String ASANA_PAT =
+        '2/1202109556148637/1208926279500557:c72800628719c4ab8344f0a9a58d6ae8';
+
+    /*───────────────────────────────────────────────────────────────
+     *  State
+     *───────────────────────────────────────────────────────────────*/
+    private final String asanaGid;          // gid of the task just created
+
+    public RegisterAsanaWebhook(String asanaGid) {
+        this.asanaGid = asanaGid;
+    }
+
+    /*───────────────────────────────────────────────────────────────
+     *  Queueable entry point
+     *───────────────────────────────────────────────────────────────*/
+    public void execute(QueueableContext qc) {
+
+        // JSON body Asana expects
+        Map<String,Object> body = new Map<String,Object>{
+            'data' => new Map<String,Object>{
+                'resource' => asanaGid,
+                'target'   => TARGET_BASE_URL +
+                              '/services/apexrest/asana/webhook'
+            }
+        };
+
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('https://app.asana.com/api/1.0/webhooks');
+        req.setMethod('POST');
+        req.setHeader('Content-Type',  'application/json');
+        req.setHeader('Authorization', 'Bearer ' + ASANA_PAT);
+        req.setBody(JSON.serialize(body));
+
+        HttpResponse res = new Http().send(req);
+
+        if (res.getStatusCode() != 201 && res.getStatusCode() != 200) {
+            System.debug('Webhook registration failed → ' +
+                         res.getStatus() + ' : ' + res.getBody());
+            // Optional: log for retry
+        } else {
+            System.debug('Webhook registered for task ' + asanaGid);
+        }
+    }
+}
